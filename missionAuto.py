@@ -9,6 +9,8 @@ import PyQt5.QtCore as QtCore
 import PyQt5.QtGui as QtGui
 import pyautogui as pag
 import tabulate
+import keyboard
+import re
 
 from __init__ import __BASE_DIR__, logger
 from wcwidth import wcswidth
@@ -23,9 +25,9 @@ class MissionAuto(QtWidgets.QWidget):
         # 属性设置
         self.selected_script = QtWidgets.QListWidgetItem()
         self.script_list = []
-        self.lock = threading.Lock()
         self.script_df = pd.DataFrame()
         self.logger = logger
+        self.terminate_flag = False
 
         # log框型注释：新的运行开始了！
         self.print_and_log(
@@ -207,9 +209,17 @@ class MissionAuto(QtWidgets.QWidget):
             # 更新菜单列表
             self.update_menu_list()
 
+        # 相关信号与槽函数的连接不可以放在反复调用的函数中，否则会出现重复
+
         # 为菜单列表中的每一项添加点击事件
         # 不可以将本语句放在update_menu_list()中，否则会出现重复
         self.menu_list.itemClicked.connect(self.wait_for_operation)
+
+        # 为按钮添加点击事件
+        # 不可以放在wait_for_operation()中，否则会出现重复
+        self.select_script_button.clicked.connect(self.auto_mission)
+        self.script_edit_button.clicked.connect(self.script_edit)
+        self.script_delete_button.clicked.connect(self.script_delete)
 
     def reload_script_list(self):
         # 清空脚本列表
@@ -248,35 +258,30 @@ class MissionAuto(QtWidgets.QWidget):
         # log用户选择的脚本：脚本名称
         self.print_and_log(f"用户选择的脚本：{self.selected_script.text()}")
 
-        # 为按钮添加点击事件
-        self.select_script_button.clicked.connect(self.auto_mission)
-        self.script_edit_button.clicked.connect(self.script_edit)
-        self.script_delete_button.clicked.connect(self.script_delete)
-
     def auto_mission(self):
         """执行用户选择的脚本"""
-        # 对话窗口最小化
-        self.showMinimized()
         # 如果没有选择脚本，函数无法执行
         if self.selected_script.text() == "":
             return
+        # 对话窗口最小化
+        self.showMinimized()
         # log执行用户选择的脚本：脚本名称
         self.print_and_log(f"执行用户选择的脚本：{self.selected_script.text()}")
         # 根据脚本名称，读取脚本文件，获取脚本内容转为dataframe
         with open(
             os.path.join(__BASE_DIR__, "mission", self.selected_script.text()), "r"
         ) as f:
-            script_df = pd.read_csv(f, index_col=0, encoding="utf-8")
+            self.script_df = pd.read_csv(f, index_col=0, encoding="utf-8")
             # 将状态列的列表字符串转为列表
-            script_df["状态"] = script_df["状态"].apply(lambda x: eval(x))
+            self.script_df["状态"] = self.script_df["状态"].apply(lambda x: eval(x))
             # 格式化脚本dataframe
-            formated_script_df = self.formated_dataframe(script_df)
+            formated_script_df = self.formated_dataframe(self.script_df)
             # log脚本内容：脚本内容
             self.print_and_log(
                 f"\n脚本内容：\n{tabulate.tabulate(formated_script_df.values.tolist(), headers=formated_script_df.columns.tolist(), tablefmt='psql')}\n"
             )
             # 解释脚本内容，并执行
-            self.mission_interpreter(script_df=script_df)
+            self.mission_interpreter()
 
     def formated_dataframe(self, script_df: pd.DataFrame) -> pd.DataFrame:
         """将脚本dataframe格式化"""
@@ -295,99 +300,224 @@ class MissionAuto(QtWidgets.QWidget):
         # 返回格式化后的脚本dataframe
         return formated_script_df
 
-    def mission_interpreter(self, script_df: pd.DataFrame):
+    def mission_interpreter(self):
         """解释脚本内容，并执行"""
         print("开始执行脚本")
         time_interval = 1
+        # 键盘钩子，用于检测是否按下Esc键
+        keyboard.add_hotkey("esc", self.terminate_mission, suppress=True)
+
         # 遍历脚本每行内容
-        for _, record in script_df.iterrows():
-            self.print_and_log(f"当前操作：\n{record}\n")
-            match record["操作"]:
-                case "左键单击":
-                    # self.print_and_log("左键单击")
-                    while True:
-                        # 根据截图路径，定位坐标，和截图有90%的相似度即认为匹配成功
-                        button_position_1 = pag.locateCenterOnScreen(record["截图"], confidence=0.9)  # type: ignore
-                        # 如果没有找到截图，重新定位坐标
-                        for i in range(30):
-                            if button_position_1 is not None:
-                                break
+        for _, record in self.script_df.iterrows():
+            if self.terminate_flag:
+                break
+            self.print_and_log(f"当前操作：\n{record}")
+            # 处理后续操作
+            self.handle_afterwards(record, time_interval)
+            # 处理单个操作
+            self.handle_single_action(record, time_interval)
 
-                            self.set_prompt("未找到截图，重新定位坐标，第{}/30次".format(i + 1))
-                            # log未找到截图，重新定位坐标，第i+1次
-                            self.print_and_log("未找到截图，重新定位坐标，第{}/30次".format(i + 1))
-                            # 间隔0.5秒，重新定位坐标
-                            pag.sleep(0.5)
-                            button_position_1 = pag.locateCenterOnScreen(record["截图"])  # type: ignore
+        if not self.terminate_flag:
+            # log脚本执行完毕
+            self.print_and_log("脚本执行完毕")
+            # 还原窗口显示
+            self.showNormal()
+        # 键盘脱钩
+        keyboard.unhook_all()
+        # 重置终止标志
+        self.terminate_flag = False
+        # 还原窗口显示
+        self.showNormal()
 
-                            if i == 29 and button_position_1 is None:
-                                self.set_prompt("根据截图定位失败，请确保截图中的按钮在屏幕中")
-                                self.print_and_log("根据截图定位失败，请确保截图中的按钮在屏幕中")
-                                self.quit_program()
+    def terminate_mission(self):
+        """中止脚本执行"""
+        # log中止脚本执行
+        self.print_and_log("中止脚本执行")
+        self.terminate_flag = True
 
-                        # 根据坐标，点击鼠标
-                        pag.moveTo(
-                            button_position_1[0],
-                            button_position_1[1],
-                            duration=time_interval,
-                        )
-                        # 由于网页加载等原因，可能会导致页面元素偏移，因此需要校对坐标
-                        button_position_2 = pag.locateCenterOnScreen(record["截图"], confidence=0.9)  # type: ignore
-                        # 比较两次截图的坐标是否相同，如果不同，重新定位坐标
-                        if button_position_1 != button_position_2:
-                            self.print_and_log("页面元素发生移动，重新定位坐标")
-                        else:
+    def handle_single_action(self, record: pd.Series, time_interval: int):
+        """处理单个操作"""
+        # 用户按下Esc键，中止脚本执行
+        if self.terminate_flag:
+            # log中止脚本执行
+            self.print_and_log("中止脚本执行")
+            return
+        match record["操作"]:
+            case "左键单击":
+                # self.print_and_log("左键单击")
+                while True:
+                    # 根据截图路径，定位坐标，和截图有90%的相似度即认为匹配成功
+                    button_position_1 = pag.locateCenterOnScreen(record["截图"], confidence=0.85)  # type: ignore
+                    # 如果没有找到截图，重新定位坐标
+                    for i in range(30):
+                        if button_position_1 is not None:
                             break
+                        if self.terminate_flag:
+                            # log中止脚本执行
+                            self.print_and_log("中止脚本执行")
+                            return
 
-                    pag.click(
-                        button="left", x=button_position_1[0], y=button_position_1[1]
-                    )
+                        # log未找到截图，重新定位坐标，第i+1次
+                        self.print_and_log("未找到截图，重新定位坐标，第{}/30次".format(i + 1))
+                        # 间隔0.5秒，重新定位坐标
+                        pag.sleep(time_interval / 2)
+                        button_position_1 = pag.locateCenterOnScreen(record["截图"])  # type: ignore
 
-                case "左键双击":
-                    # self.print_and_log("左键双击")
-                    x_pos, y_pos = record["状态"]
-                    pag.moveTo(x_pos, y_pos, duration=time_interval / 50)
-                    pag.click(button="left", x=x_pos, y=y_pos)
-                case "右键单击":
-                    # self.print_and_log("右键单击")
-                    x_pos, y_pos = record["状态"]
-                    pag.moveTo(x_pos, y_pos, duration=time_interval)
-                    pag.click(button="right", x=x_pos, y=y_pos)
-                case "左键长按":
-                    # self.print_and_log("左键长按")
-                    x_pos, y_pos, duration = record["状态"]
-                    pag.moveTo(x_pos, y_pos, duration=time_interval)
-                    pag.mouseDown(
-                        button="left", x=x_pos, y=y_pos, duration=duration + 0.5
-                    )
-                case "右键长按":
-                    # self.print_and_log("右键长按")
-                    x_pos, y_pos, duration = record["状态"]
-                    pag.moveTo(x_pos, y_pos, duration=time_interval)
-                    pag.mouseDown(
-                        button="right", x=x_pos, y=y_pos, duration=duration + 0.5
-                    )
-                case "左键释放":
-                    # self.print_and_log("左键释放")
-                    x_pos, y_pos = record["状态"]
-                    pag.moveTo(x_pos, y_pos, duration=time_interval / 50)
-                    pag.mouseUp(button="left", x=x_pos, y=y_pos)
-                case "右键释放":
-                    # self.print_and_log("右键释放")
-                    x_pos, y_pos = record["状态"]
-                    pag.moveTo(x_pos, y_pos, duration=time_interval / 50)
-                    pag.mouseUp(button="right", x=x_pos, y=y_pos)
-                case "滚轮":
-                    # self.print_and_log("滚轮")
-                    x_pos, y_pos, x_scroll, y_scroll = record["状态"]
-                    pag.scroll(x_scroll, y_scroll, x_pos, y_pos)
-                case "键盘录制结果":
-                    # self.print_and_log("输出键盘录制结果")
-                    key_events = record["状态"][:-3]
-                    for key_event in key_events:
-                        pag.press(key_event)
+                        if i == 29 and button_position_1 is None:
+                            self.set_prompt("根据截图定位失败，请确保截图中的按钮在屏幕中")
+                            self.print_and_log("根据截图定位失败，请确保截图中的按钮在屏幕中")
+                            self.quit_program()
 
-        self.print_and_log("脚本执行完毕")
+                    # 根据坐标，点击鼠标
+                    pag.moveTo(
+                        button_position_1[0],
+                        button_position_1[1],
+                        duration=time_interval,
+                    )
+                    # 由于网页加载等原因，可能会导致页面元素偏移，因此需要校对坐标
+                    button_position_2 = pag.locateCenterOnScreen(record["截图"], confidence=0.85)  # type: ignore
+                    # 比较两次截图的坐标，如果横纵坐标相差超过5，重新定位坐标
+                    if (
+                        abs(button_position_1[0] - button_position_2[0]) > 5
+                        or abs(button_position_1[1] - button_position_2[1]) > 5
+                    ):
+                        self.print_and_log("页面元素发生移动，重新定位坐标")
+                    else:
+                        break
+
+                pag.click(button="left", x=button_position_1[0], y=button_position_1[1])
+
+            case "左键双击":
+                # self.print_and_log("左键双击")
+                x_pos, y_pos = record["状态"]
+                pag.moveTo(x_pos, y_pos, duration=time_interval / 50)
+                pag.click(button="left", x=x_pos, y=y_pos)
+            case "右键单击":
+                # self.print_and_log("右键单击")
+                x_pos, y_pos = record["状态"]
+                pag.moveTo(x_pos, y_pos, duration=time_interval)
+                pag.click(button="right", x=x_pos, y=y_pos)
+            case "左键长按":
+                # self.print_and_log("左键长按")
+                x_pos, y_pos, duration = record["状态"]
+                pag.moveTo(x_pos, y_pos, duration=time_interval)
+                pag.mouseDown(button="left", x=x_pos, y=y_pos, duration=duration + 0.5)
+            case "右键长按":
+                # self.print_and_log("右键长按")
+                x_pos, y_pos, duration = record["状态"]
+                pag.moveTo(x_pos, y_pos, duration=time_interval)
+                pag.mouseDown(button="right", x=x_pos, y=y_pos, duration=duration + 0.5)
+            case "左键释放":
+                # self.print_and_log("左键释放")
+                x_pos, y_pos = record["状态"]
+                pag.moveTo(x_pos, y_pos, duration=time_interval / 50)
+                pag.mouseUp(button="left", x=x_pos, y=y_pos)
+            case "右键释放":
+                # self.print_and_log("右键释放")
+                x_pos, y_pos = record["状态"]
+                pag.moveTo(x_pos, y_pos, duration=time_interval / 50)
+                pag.mouseUp(button="right", x=x_pos, y=y_pos)
+            case "滚轮":
+                # self.print_and_log("滚轮")
+                x_pos, y_pos, _, y_scroll = record["状态"]
+                pag.scroll(y_scroll * 75, x_pos, y_pos)
+            case "键盘录制结果":
+                # self.print_and_log("输出键盘录制结果")
+                key_events = record["状态"][:-3]
+                for key_event in key_events:
+                    pag.press(key_event)
+
+    def handle_afterwards(self, record: pd.Series, time_interval: int):
+        """处理后续操作"""
+        # 检查当前记录的后续是否为nan，如果是，直接返回
+        if pd.isna(record["后续"]):
+            return
+
+        # 将后续操作转为字符串
+        afterwards = str(record["后续"])
+        self.print_and_log(f"{record['操作']}后续操作：{afterwards}")
+
+        # 设定后续操作
+        loop_pattern = r"LOOP\((\d+)\)"
+        loop_pattern_with_count = r"LOOP\((\d+),(\d+)\)"
+
+        # 匹配后续操作
+        if re.match(loop_pattern, afterwards):
+            # 匹配到无限循环
+            match = re.match(loop_pattern, afterwards)
+            # 获取循环的行数
+            if match:
+                loop_row_start = self.script_df.index.get_loc(record.name)
+                loop_row_end = int(match.group(1))
+                # 验证loop_row_end是否大于总行数
+                if loop_row_end > self.script_df.shape[0]:
+                    loop_row_end = self.script_df.shape[0] - 1
+                # loop_row_end不应该小于loop_row_start
+                if loop_row_end < loop_row_start:
+                    loop_row_end = loop_row_start
+                self.handle_loop_afterwards(
+                    record, time_interval, loop_row_start, loop_row_end
+                )
+
+        elif re.match(loop_pattern_with_count, afterwards):
+            # 匹配到有限循环
+            match = re.match(loop_pattern_with_count, afterwards)
+            # 获取循环的行数和循环次数
+            if match:
+                loop_row_start = self.script_df.index.get_loc(record.name)
+                loop_row_end = int(match.group(1))
+                loop_count = int(match.group(2))
+                # 验证loop_row_end是否大于总行数
+                if loop_row_end > self.script_df.shape[0]:
+                    loop_row_end = self.script_df.shape[0] - 1
+                # loop_row_end不应该小于loop_row_start
+                if loop_row_end < loop_row_start:
+                    loop_row_end = loop_row_start
+                self.handle_loop_with_count_afterwards(
+                    record, time_interval, loop_row_start, loop_row_end, loop_count
+                )
+
+    def handle_loop_afterwards(
+        self, record: pd.Series, time_interval: int, loop_start: int, loop_end: int
+    ):
+        """无限循环指定的行数"""
+        self.print_and_log("开始无限循环指定的行数")
+        loop_times = 0
+        while True:
+            loop_times += 1
+            self.print_and_log(f"第{loop_times}次循环")
+            for _, record in self.script_df[loop_start : loop_end + 1].iterrows():
+                if self.terminate_flag:
+                    # log中止脚本执行
+                    self.print_and_log("中止脚本执行")
+                    return
+                self.print_and_log(f"当前操作：\n{record}")
+                # 处理单个操作
+                self.handle_single_action(record, time_interval)
+
+    def handle_loop_with_count_afterwards(
+        self,
+        record: pd.Series,
+        time_interval: int,
+        loop_start: int,
+        loop_end: int,
+        loop_count: int,
+    ):
+        """有限循环指定的行数"""
+        self.print_and_log("开始有限循环指定的行数")
+        current_loop_count = 1
+        # 循环次数-1的原因是返回mission_interpreter()时，循环行数会再执行一次
+        for _ in range(loop_count - 1):
+            self.print_and_log(f"循环次数：{current_loop_count}/{loop_count}")
+            current_loop_count += 1
+            for _, record in self.script_df[loop_start : loop_end + 1].iterrows():
+                if self.terminate_flag:
+                    # log中止脚本执行
+                    self.print_and_log("中止脚本执行")
+                    return
+                self.print_and_log(f"当前操作：\n{record}")
+                # 处理单个操作
+                self.handle_single_action(record, time_interval)
 
     def script_record(self):
         """录制新的脚本"""
